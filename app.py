@@ -4,6 +4,18 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import LabelEncoder
+
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
+
 st.set_page_config(page_title="Cambodia Food Price Dashboard", layout="wide", page_icon="🍚")
 
 EXCLUDE_COLS = ['N0', 'Food commodity', 'Pricing Type', 'Currency', "YTD'24", "YTD'25", 'Change (%)']
@@ -29,6 +41,65 @@ def load_data(file):
     yoy['Change (%)'] = yoy['Change (%)'] * 100
 
     return df, long_df, yoy, date_cols
+
+# ---------- ML model training ----------
+@st.cache_resource
+def train_models(long_df):
+    ml_df = long_df.copy()
+    ml_df['Year'] = ml_df['Date'].dt.year
+    ml_df['Month'] = ml_df['Date'].dt.month
+
+    commodity_encoder = LabelEncoder()
+    pricing_encoder = LabelEncoder()
+    ml_df['Commodity_ID'] = commodity_encoder.fit_transform(ml_df['Food commodity'])
+    ml_df['Pricing_ID'] = pricing_encoder.fit_transform(ml_df['Pricing Type'])
+
+    features = ['Year', 'Month', 'Commodity_ID', 'Pricing_ID']
+    X = ml_df[features]
+    y = ml_df['Price']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    models = {}
+    metrics = []
+
+    lr = LinearRegression()
+    lr.fit(X_train, y_train)
+    pred = lr.predict(X_test)
+    models['Linear Regression'] = lr
+    metrics.append(['Linear Regression', mean_absolute_error(y_test, pred),
+                     np.sqrt(mean_squared_error(y_test, pred)), r2_score(y_test, pred)])
+
+    rf = RandomForestRegressor(n_estimators=300, max_depth=10, random_state=42, n_jobs=-1)
+    rf.fit(X_train, y_train)
+    pred = rf.predict(X_test)
+    models['Random Forest'] = rf
+    metrics.append(['Random Forest', mean_absolute_error(y_test, pred),
+                     np.sqrt(mean_squared_error(y_test, pred)), r2_score(y_test, pred)])
+
+    if XGBOOST_AVAILABLE:
+        xgb = XGBRegressor(n_estimators=500, learning_rate=0.05, max_depth=6, random_state=42)
+        xgb.fit(X_train, y_train)
+        pred = xgb.predict(X_test)
+        models['XGBoost'] = xgb
+        metrics.append(['XGBoost', mean_absolute_error(y_test, pred),
+                         np.sqrt(mean_squared_error(y_test, pred)), r2_score(y_test, pred)])
+
+    metrics_df = pd.DataFrame(metrics, columns=['Model', 'MAE', 'RMSE', 'R2'])
+    return models, metrics_df, commodity_encoder, pricing_encoder, features
+
+
+def linear_trend_forecast(item_df, periods):
+    """Simple per-item linear trend extrapolation as a sanity-check baseline."""
+    item_df = item_df.sort_values('Date').reset_index(drop=True)
+    t = np.arange(len(item_df)).reshape(-1, 1)
+    y = item_df['Price'].values
+    if len(item_df) < 2:
+        return None
+    model = LinearRegression().fit(t, y)
+    future_t = np.arange(len(item_df), len(item_df) + periods).reshape(-1, 1)
+    return model.predict(future_t)
+
 
 st.sidebar.title("🍚 Food Price Dashboard")
 st.sidebar.caption("Cambodia Retail & Wholesale Commodity Prices (KHR)")
@@ -86,7 +157,8 @@ st.divider()
 
 tabs = st.tabs([
     "📈 Trends", "💰 Rankings", "📊 Retail vs Wholesale",
-    "🔥 YoY Inflation", "🌡️ Volatility", "🔗 Correlation", "🗂️ Raw Data"
+    "🔥 YoY Inflation", "🌡️ Volatility", "🔗 Correlation",
+    "🔮 Forecast", "🗂️ Raw Data"
 ])
 
 # ---------- Trends ----------
@@ -211,8 +283,104 @@ with tabs[5]:
     fig12 = px.imshow(corr_matrix, color_continuous_scale='RdBu_r', zmin=-1, zmax=1, aspect='auto')
     st.plotly_chart(fig12, use_container_width=True)
 
-# ---------- Raw data ----------
+# ---------- Forecast ----------
 with tabs[6]:
+    st.subheader("🔮 Price Forecasting (Retail & Wholesale)")
+    st.caption(
+        "Models are trained once on the full historical dataset (Year, Month, Commodity, "
+        "Pricing Type → Price) and reused across every commodity you select below."
+    )
+
+    with st.spinner("Training models..."):
+        models, metrics_df, commodity_encoder, pricing_encoder, features = train_models(long_df)
+
+    st.markdown("**Model Comparison (on held-out 20% test set)**")
+    st.dataframe(
+        metrics_df.style.format({'MAE': '{:,.0f}', 'RMSE': '{:,.0f}', 'R2': '{:.3f}'}),
+        use_container_width=True
+    )
+
+    model_options = list(models.keys())
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        fc_commodity = st.selectbox("Commodity", commodities, key="fc_commodity")
+    with c2:
+        fc_pricing = st.selectbox("Pricing Type", pricing_types, key="fc_pricing")
+    with c3:
+        fc_model_name = st.selectbox("Model", model_options, index=len(model_options) - 1, key="fc_model")
+    with c4:
+        fc_horizon = st.slider("Forecast horizon (months)", 3, 24, 12, key="fc_horizon")
+
+    item_hist = long_df[
+        (long_df['Food commodity'] == fc_commodity) & (long_df['Pricing Type'] == fc_pricing)
+    ].sort_values('Date')
+
+    if item_hist.empty:
+        st.warning("No historical data for this commodity / pricing type combination.")
+    else:
+        last_date = item_hist['Date'].max()
+        future_dates = pd.date_range(last_date + pd.DateOffset(months=1), periods=fc_horizon, freq='MS')
+
+        future_X = pd.DataFrame({
+            'Year': future_dates.year,
+            'Month': future_dates.month,
+            'Commodity_ID': commodity_encoder.transform([fc_commodity] * fc_horizon),
+            'Pricing_ID': pricing_encoder.transform([fc_pricing] * fc_horizon),
+        })[features]
+
+        chosen_model = models[fc_model_name]
+        ml_forecast = chosen_model.predict(future_X)
+
+        trend_forecast = linear_trend_forecast(item_hist, fc_horizon)
+
+        fig_fc = go.Figure()
+        fig_fc.add_trace(go.Scatter(
+            x=item_hist['Date'], y=item_hist['Price'], mode='lines+markers', name='Historical'
+        ))
+        fig_fc.add_trace(go.Scatter(
+            x=future_dates, y=ml_forecast, mode='lines+markers', name=f'{fc_model_name} Forecast',
+            line=dict(dash='dash')
+        ))
+        if trend_forecast is not None:
+            fig_fc.add_trace(go.Scatter(
+                x=future_dates, y=trend_forecast, mode='lines', name='Linear Trend (baseline)',
+                line=dict(dash='dot')
+            ))
+        fig_fc.update_layout(
+            title=f"{fc_commodity} — {fc_pricing} Price Forecast",
+            yaxis_title="Price (KHR)", xaxis_title="Date"
+        )
+        st.plotly_chart(fig_fc, use_container_width=True)
+
+        st.info(
+            "⚠️ Tree-based models (Random Forest / XGBoost) learn patterns from historical "
+            "Year/Month combinations and tend to flatten out beyond the training range rather than "
+            "extrapolate a trend. The dotted **Linear Trend** line is a simple per-item baseline "
+            "that better reflects directional momentum — compare both before relying on the forecast."
+        )
+
+        forecast_table = pd.DataFrame({
+            'Date': future_dates.strftime('%Y-%m'),
+            f'{fc_model_name} Forecast (KHR)': ml_forecast.round(0),
+            'Linear Trend (KHR)': (trend_forecast.round(0) if trend_forecast is not None else np.nan)
+        })
+        st.dataframe(forecast_table, use_container_width=True)
+        st.download_button(
+            "Download forecast as CSV", forecast_table.to_csv(index=False),
+            f"forecast_{fc_commodity.replace(' ', '_')}_{fc_pricing}.csv"
+        )
+
+        if fc_model_name in ('Random Forest', 'XGBoost'):
+            st.markdown("**Feature Importance**")
+            imp_df = pd.DataFrame({
+                'Feature': features, 'Importance': chosen_model.feature_importances_
+            }).sort_values('Importance', ascending=False)
+            fig_imp = px.bar(imp_df, x='Importance', y='Feature', orientation='h')
+            fig_imp.update_layout(yaxis={'categoryorder': 'total ascending'})
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+# ---------- Raw data ----------
+with tabs[7]:
     st.subheader("Raw Dataset")
     st.dataframe(raw_df, use_container_width=True)
     st.subheader("Cleaned Long-Format Data (filtered)")
